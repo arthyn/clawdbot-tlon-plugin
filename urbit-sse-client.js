@@ -195,8 +195,19 @@ export class UrbitSSEClient {
         return;
       }
 
+      // Handle poke responses - check for errors!
+      if (parsed.response === "poke") {
+        if ("ok" in parsed) {
+          console.log(`[SSE] Poke ${parsed.id} succeeded (ok)`);
+        } else if ("err" in parsed) {
+          console.error(`[SSE] ❌ POKE ${parsed.id} FAILED:`, parsed.err);
+          // This is the async error response - the HTTP 204 was just acknowledgment
+        }
+        return;
+      }
+
       // Debug: Log received events (skip subscription confirmations)
-      if (parsed.response !== "subscribe" && parsed.response !== "poke") {
+      if (parsed.response !== "subscribe") {
         console.log("[SSE] Received event:", JSON.stringify(parsed).substring(0, 500));
       }
 

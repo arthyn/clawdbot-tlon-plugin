@@ -21,7 +21,7 @@ import { unixToDa, formatUd } from "@urbit/aura";
 import { UrbitSSEClient } from "./urbit-sse-client.js";
 import { loadCoreChannelDeps } from "./core-bridge.js";
 
-console.log("[tlon] ====== monitor.js loaded with thread reply fix + dedup fix (commit fad6ef0) ======");
+console.log("[tlon] ====== monitor.js v2 loaded with action.post.reply structure ======");
 
 /**
  * Formats model name for display in signature
@@ -83,27 +83,63 @@ async function authenticate(url, code) {
 /**
  * Sends a direct message via Urbit
  */
-async function sendDm(api, fromShip, toShip, text) {
+/**
+ * Sends a DM to another ship
+ * @param {object} api - The Urbit SSE client
+ * @param {string} fromShip - The sender's ship name
+ * @param {string} toShip - The recipient's ship name
+ * @param {string} text - The message text
+ * @param {string} replyTo - Optional parent writ ID for threading
+ */
+async function sendDm(api, fromShip, toShip, text, replyTo = null) {
   const story = [{ inline: [text] }];
   const sentAt = Date.now();
   const idUd = formatUd(unixToDa(sentAt).toString());
   const id = `${fromShip}/${idUd}`;
 
-  const delta = {
-    add: {
-      memo: {
-        content: story,
-        author: fromShip,
-        sent: sentAt,
+  let delta;
+  let diffId;
+
+  if (replyTo) {
+    // Reply to existing writ - nested under reply.delta.add
+    // NOTE: 'meta' must be null when sending (server computes the actual values)
+    diffId = replyTo;  // The writ we're replying to
+    const replyId = `${fromShip}/${idUd}`;
+    delta = {
+      reply: {
+        id: replyId,  // ID for this reply (must include ship prefix)
+        meta: null,   // Server-computed, must be null when sending
+        delta: {
+          add: {
+            memo: {
+              content: story,
+              author: fromShip,
+              sent: sentAt,
+            },
+            time: null,
+          }
+        }
+      }
+    };
+  } else {
+    // New top-level writ
+    diffId = id;
+    delta = {
+      add: {
+        memo: {
+          content: story,
+          author: fromShip,
+          sent: sentAt,
+        },
+        kind: null,
+        time: null,
       },
-      kind: null,
-      time: null,
-    },
-  };
+    };
+  }
 
   const action = {
     ship: toShip,
-    diff: { id, delta },
+    diff: { id: diffId, delta },
   };
 
   await api.poke({
@@ -116,23 +152,37 @@ async function sendDm(api, fromShip, toShip, text) {
 }
 
 /**
+ * Format a numeric ID with dots every 3 digits (Urbit @ud format)
+ * Example: "170141184507780357587090523864791252992" -> "170.141.184.507.780.357.587.090.523.864.791.252.992"
+ */
+function formatUdId(id) {
+  if (!id) return id;
+  const idStr = String(id);
+  // Insert dots every 3 characters from the left
+  return idStr.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+/**
  * Sends a message to a group channel
  * @param {string} replyTo - Optional parent post ID for threading
  */
-async function sendGroupMessage(api, fromShip, hostShip, channelName, text, replyTo = null) {
+async function sendGroupMessage(api, fromShip, hostShip, channelName, text, replyTo = null, runtime = null) {
   const story = [{ inline: [text] }];
   const sentAt = Date.now();
+
+  // Format reply ID with dots for Urbit @ud format
+  const formattedReplyTo = replyTo ? formatUdId(replyTo) : null;
 
   const action = {
     channel: {
       nest: `chat/${hostShip}/${channelName}`,
-      action: replyTo ? {
-        // Reply action for threading
-        reply: {
-          id: replyTo,
-          delta: {
-            add: {
-              memo: {
+      action: formattedReplyTo ? {
+        // Reply action for threading (wraps reply in post like official client)
+        post: {
+          reply: {
+            id: formattedReplyTo,
+            action: {
+              add: {
                 content: story,
                 author: fromShip,
                 sent: sentAt,
@@ -156,13 +206,24 @@ async function sendGroupMessage(api, fromShip, hostShip, channelName, text, repl
     },
   };
 
-  await api.poke({
-    app: "channels",
-    mark: "channel-action-1",
-    json: action,
-  });
+  runtime?.log?.(`[tlon] 📤 Sending message: replyTo=${replyTo} (formatted: ${formattedReplyTo}), text="${text.substring(0, 100)}...", nest=chat/${hostShip}/${channelName}`);
+  runtime?.log?.(`[tlon] 📤 Action type: ${formattedReplyTo ? 'REPLY (thread)' : 'POST (main channel)'}`);
+  runtime?.log?.(`[tlon] 📤 Full action structure: ${JSON.stringify(action, null, 2)}`);
 
-  return { channel: "tlon", success: true, messageId: `${fromShip}/${sentAt}` };
+  try {
+    const pokeResult = await api.poke({
+      app: "channels",
+      mark: "channel-action-1",
+      json: action,
+    });
+
+    runtime?.log?.(`[tlon] 📤 Poke succeeded: ${JSON.stringify(pokeResult)}`);
+    return { channel: "tlon", success: true, messageId: `${fromShip}/${sentAt}` };
+  } catch (error) {
+    runtime?.error?.(`[tlon] 📤 Poke FAILED: ${error.message}`);
+    runtime?.error?.(`[tlon] 📤 Error details: ${JSON.stringify(error)}`);
+    throw error;
+  }
 }
 
 /**
@@ -534,16 +595,34 @@ export async function monitorTlonProvider(opts = {}) {
    */
   const handleIncomingDM = async (update) => {
     try {
-      runtime.log?.(`[tlon] DM handler called with update: ${JSON.stringify(update).substring(0, 200)}`);
+      runtime.log?.(`[tlon] DM handler called with update: ${JSON.stringify(update).substring(0, 500)}`);
 
-      // Handle new DM event format: response.add.memo
-      const memo = update?.response?.add?.memo;
+      // Handle both top-level DMs and DM thread replies
+      // Top-level: response.add.memo
+      // Thread reply: response.reply.delta.add.memo (memo nested in delta.add)
+      let memo = update?.response?.add?.memo;
+      let parentId = null;
+      let isThreadReply = false;
+
+      // Check for thread reply structure
+      // Actual DM reply structure: { id: "parent-msg-id", response: { reply: { delta: { add: { memo: {...} } }, id: "reply-id" } } }
+      if (!memo && update?.response?.reply) {
+        memo = update.response.reply?.delta?.add?.memo;
+        // parentId is the top-level id (the message being replied TO)
+        parentId = update.id;
+        isThreadReply = true;
+        runtime.log?.(`[tlon] DM is a thread reply, parentId: ${parentId}`);
+      }
+
       if (!memo) {
-        runtime.log?.(`[tlon] DM update has no memo in response.add`);
+        runtime.log?.(`[tlon] DM update has no memo (checked add and reply structures)`);
         return;
       }
 
-      const messageId = update.id;
+      // For thread replies, use the reply's own ID for dedup (not the parent's ID)
+      // Top-level: update.id is the message ID
+      // Thread reply: update.response.reply.id is the reply's unique ID
+      const messageId = isThreadReply ? update.response.reply.id : update.id;
       if (processedMessages.has(messageId)) return;
       processedMessages.add(messageId);
 
@@ -566,7 +645,7 @@ export async function monitorTlonProvider(opts = {}) {
       }
 
       runtime.log?.(
-        `[tlon] Received DM from ${senderShip}: "${messageText.slice(0, 50)}..."`
+        `[tlon] Received DM from ${senderShip}: "${messageText.slice(0, 50)}..."${isThreadReply ? ` (thread reply to ${parentId})` : ''}`
       );
 
       // All DMs are processed (no mention check needed)
@@ -577,6 +656,7 @@ export async function monitorTlonProvider(opts = {}) {
         messageText,
         isGroup: false,
         timestamp: memo.sent || Date.now(),
+        parentId,  // Pass parentId for thread replies
       });
     } catch (error) {
       runtime.error?.(`[tlon] Error handling DM: ${error.message}`);
@@ -739,7 +819,7 @@ export async function monitorTlonProvider(opts = {}) {
       seal,
     } = params;
 
-    runtime.log?.(`[tlon] processMessage called for ${senderShip}, isGroup: ${isGroup}, message: "${messageText.substring(0, 50)}"`);
+    runtime.log?.(`[tlon] processMessage called for ${senderShip}, isGroup: ${isGroup}, message: "${messageText.substring(0, 50)}", parentId: ${parentId}`);
 
     // Check if this is a summarization request
     if (isGroup && isSummarizationRequest(messageText)) {
@@ -756,7 +836,9 @@ export async function monitorTlonProvider(opts = {}) {
                 botShipName,
                 parsed.hostShip,
                 parsed.channelName,
-                noHistoryMsg
+                noHistoryMsg,
+                null,
+                runtime
               );
             }
           } else {
@@ -786,7 +868,9 @@ export async function monitorTlonProvider(opts = {}) {
               botShipName,
               parsed.hostShip,
               parsed.channelName,
-              errorMsg
+              errorMsg,
+              null,
+              runtime
             );
           }
         } else {
@@ -812,21 +896,35 @@ export async function monitorTlonProvider(opts = {}) {
       const fromLabel = isGroup
         ? `${senderShip} in ${groupName}`
         : senderShip;
+
+      // Add Tlon identity context to help AI recognize when it's being addressed
+      // The AI knows itself as "bearclawd" but in Tlon it's addressed as the ship name
+      const identityNote = `[Note: In Tlon/Urbit, you are known as ${botShipName}. When users mention ${botShipName}, they are addressing you directly.]\n\n`;
+      const messageWithIdentity = identityNote + messageText;
+
       const body = deps.formatAgentEnvelope({
         channel: "Tlon",
         from: fromLabel,
         timestamp,
-        body: messageText,
+        body: messageWithIdentity,
       });
 
       // Create inbound context
+      // For thread replies, append parent ID to session key to create separate conversation context
+      const sessionKeySuffix = parentId ? `:thread:${parentId}` : '';
+      const finalSessionKey = `${route.sessionKey}${sessionKeySuffix}`;
+
+      runtime.log?.(
+        `[tlon] 🔑 Session key construction: base="${route.sessionKey}", suffix="${sessionKeySuffix}", final="${finalSessionKey}"`
+      );
+
       const ctxPayload = deps.finalizeInboundContext({
         Body: body,
         RawBody: messageText,
         CommandBody: messageText,
         From: isGroup ? `tlon:group:${groupChannel}` : `tlon:${senderShip}`,
         To: `tlon:${botShipName}`,
-        SessionKey: route.sessionKey,
+        SessionKey: finalSessionKey,
         AccountId: route.accountId,
         ChatType: isGroup ? "group" : "direct",
         ConversationLabel: fromLabel,
@@ -839,18 +937,59 @@ export async function monitorTlonProvider(opts = {}) {
         OriginatingTo: `tlon:${isGroup ? groupChannel : botShipName}`,
       });
 
+      runtime.log?.(
+        `[tlon] 📋 Context payload keys: ${Object.keys(ctxPayload).join(', ')}`
+      );
+      runtime.log?.(
+        `[tlon] 📋 Message body: "${body.substring(0, 100)}${body.length > 100 ? '...' : ''}"`
+      );
+
+      // Log transcript details
+      if (ctxPayload.Transcript && ctxPayload.Transcript.length > 0) {
+        runtime.log?.(
+          `[tlon] 📜 Transcript has ${ctxPayload.Transcript.length} message(s)`
+        );
+        // Log last few messages for debugging
+        const recentMessages = ctxPayload.Transcript.slice(-3);
+        recentMessages.forEach((msg, idx) => {
+          runtime.log?.(
+            `[tlon] 📜 Transcript[-${3-idx}]: role=${msg.role}, content length=${JSON.stringify(msg.content).length}`
+          );
+        });
+      } else {
+        runtime.log?.(
+          `[tlon] 📜 Transcript is empty or missing`
+        );
+      }
+
+      // Log key fields that affect AI behavior
+      runtime.log?.(
+        `[tlon] 📝 BodyForAgent: "${ctxPayload.BodyForAgent?.substring(0, 100)}${(ctxPayload.BodyForAgent?.length || 0) > 100 ? '...' : ''}"`
+      );
+      runtime.log?.(
+        `[tlon] 📝 ThreadStarterBody: "${ctxPayload.ThreadStarterBody?.substring(0, 100) || 'null'}${(ctxPayload.ThreadStarterBody?.length || 0) > 100 ? '...' : ''}"`
+      );
+      runtime.log?.(
+        `[tlon] 📝 CommandAuthorized: ${ctxPayload.CommandAuthorized}`
+      );
+
       // Dispatch to AI and get response
       const dispatchStartTime = Date.now();
       runtime.log?.(
         `[tlon] Dispatching to AI for ${senderShip} (${isGroup ? `group: ${groupName}` : 'DM'})`
       );
+      runtime.log?.(
+        `[tlon] 🚀 Dispatch details: sessionKey="${finalSessionKey}", isThreadReply=${!!parentId}, messageText="${messageText.substring(0, 50)}..."`
+      );
 
-      await deps.dispatchReplyWithBufferedBlockDispatcher({
+      const dispatchResult = await deps.dispatchReplyWithBufferedBlockDispatcher({
         ctx: ctxPayload,
         cfg: opts.cfg,
         dispatcherOptions: {
           deliver: async (payload) => {
+            runtime.log?.(`[tlon] 🎯 Deliver callback invoked! isThreadReply=${!!parentId}, parentId=${parentId}`);
             const dispatchDuration = Date.now() - dispatchStartTime;
+            runtime.log?.(`[tlon] 📦 Payload keys: ${Object.keys(payload).join(', ')}, text length: ${payload.text?.length || 0}`);
             let replyText = payload.text;
 
             if (!replyText) {
@@ -906,7 +1045,8 @@ export async function monitorTlonProvider(opts = {}) {
                   parsed.hostShip,
                   parsed.channelName,
                   replyText,
-                  parentId // Pass parentId to reply in the thread
+                  parentId, // Pass parentId to reply in the thread
+                  runtime
                 );
                 const threadInfo = parentId ? ` (in thread)` : '';
                 runtime.log?.(`[tlon] Delivered AI reply to group ${groupName}${threadInfo}`);
@@ -914,8 +1054,9 @@ export async function monitorTlonProvider(opts = {}) {
                 runtime.log?.(`[tlon] ⚠️ Failed to parse channel nest: ${groupChannel}`);
               }
             } else {
-              await sendDm(api, botShipName, senderShip, replyText);
-              runtime.log?.(`[tlon] Delivered AI reply to ${senderShip}`);
+              // Pass parentId for DM thread replies
+              await sendDm(api, botShipName, senderShip, replyText, parentId);
+              runtime.log?.(`[tlon] Delivered AI reply to ${senderShip}${parentId ? ` (thread: ${parentId})` : ''}`);
             }
           },
           onError: (err, info) => {
@@ -934,8 +1075,9 @@ export async function monitorTlonProvider(opts = {}) {
 
       const totalDuration = Date.now() - dispatchStartTime;
       runtime.log?.(
-        `[tlon] AI dispatch completed for ${senderShip} (total: ${totalDuration}ms)`
+        `[tlon] AI dispatch completed for ${senderShip} (total: ${totalDuration}ms), result keys: ${dispatchResult ? Object.keys(dispatchResult).join(', ') : 'null'}`
       );
+      runtime.log?.(`[tlon] Dispatch result: ${JSON.stringify(dispatchResult)}`);
     } catch (error) {
       runtime.error?.(`[tlon] Error processing message: ${error.message}`);
       runtime.error?.(`[tlon] Stack trace: ${error.stack}`);
